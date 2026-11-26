@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""Ensure 5G mobile data connects reliably on cold boot (5G recovery first, 4G fallback).
+
+On Xiaomi 15 Pro (SM8750), dmail's first cold-boot WDS_START_NETWORK can race
+with its initial NAS voice-preference (2, 2) update and get stuck in a 30s
+timeout / QMI error 0x001a loop on 5G SA. Restarting dmail once after (2, 2)
+is settled clears the wedged WDS client and connects on 5G SA in <1s. Only if
+5G SA still fails after recovery does this fall back to temporary 4G LTE.
+"""
+import socket
+import struct
+import subprocess
+import sys
+import time
+
+
+def log(msg):
+    ts = time.strftime("%H:%M:%S")
+    print(f"[{ts}] haotian-data-watchdog: {msg}", flush=True)
+
+
+def dmail_prop(iface, prop):
+    try:
+        return subprocess.check_output(
+            ["busctl", "get-property", "org.dmail", "/org/dmail", iface, prop],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return ""
+
+
+def wait_connected(seconds):
+    for i in range(1, seconds + 1):
+        enabled = dmail_prop("org.dmail.Data1", "Enabled")
+        state = dmail_prop("org.dmail.Data1", "State")
+        tech = dmail_prop("org.dmail.Modem1", "Technology")
+        if '"connected"' in state:
+            return True, enabled, state, tech, i
+        if "false" in enabled and i >= 8:
+            return False, enabled, state, tech, i
+        time.sleep(1.0)
+    return (
+        False,
+        dmail_prop("org.dmail.Data1", "Enabled"),
+        dmail_prop("org.dmail.Data1", "State"),
+        dmail_prop("org.dmail.Modem1", "Technology"),
+        seconds,
+    )
+
+
+def find_nas_port():
+    out = subprocess.check_output(["qrtr-lookup"], text=True)
+    for line in out.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 5 and int(parts[0]) == 3 and int(parts[3]) == 0:
+            return int(parts[4])
+    raise RuntimeError("QRTR NAS service (3) not found")
+
+
+def tlv(t, val):
+    return struct.pack("<BH", t, len(val)) + val
+
+
+def set_temp_lte():
+    nas_port = find_nas_port()
+    s = socket.socket(42, socket.SOCK_DGRAM, 0)
+    s.settimeout(5.0)
+    payload = tlv(0x11, struct.pack("<H", 0x0010)) + tlv(0x17, b"\x00")
+    s.sendto(struct.pack("<BHHH", 0, 1, 0x0033, len(payload)) + payload, (0, nas_port))
+    while True:
+        d, _ = s.recvfrom(4096)
+        if len(d) >= 7:
+            fl, rtx, rmid, rl = struct.unpack_from("<BHHH", d, 0)
+            if fl == 2 and rtx == 1 and rmid == 0x0033:
+                return d[7 : 7 + rl].hex()
+
+
+def main():
+    # Stage 1: Wait up to 15s for native 5G connection on cold boot
+    ok, enabled, state, tech, elapsed = wait_connected(15)
+    if ok:
+        log(f"connected on cold boot after {elapsed}s (tech={tech})")
+        return 0
+    if "true" not in enabled:
+        log(f"mobile data disabled (enabled={enabled}); exiting")
+        return 0
+
+    # Stage 2: 5G recovery — restart dmail once (now that voice pref (2,2) is settled)
+    log(f"not connected after {elapsed}s (state={state} tech={tech}); restarting dmail to recover 5G")
+    subprocess.run(["systemctl", "restart", "dmail.service"], check=False)
+    ok, enabled, state, tech, elapsed = wait_connected(12)
+    if ok:
+        log(f"5G recovery succeeded after {elapsed}s (tech={tech})")
+        return 0
+
+    # Stage 3: Last-resort fallback to temporary 4G LTE if 5G cell still refuses PDU session
+    log(f"5G still not connected (state={state} tech={tech}); falling back to temporary 4G LTE")
+    rc = set_temp_lte()
+    log(f"NAS 0x0033 temp LTE rc={rc}")
+    time.sleep(4.0)
+    subprocess.run(
+        ["busctl", "call", "org.dmail", "/org/dmail", "org.dmail.Data1", "Reconnect"],
+        check=False,
+    )
+    time.sleep(3.0)
+    log(
+        f"post-fallback state={dmail_prop('org.dmail.Data1', 'State')} "
+        f"tech={dmail_prop('org.dmail.Modem1', 'Technology')} "
+        f"signal={dmail_prop('org.dmail.Modem1', 'Signal')}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

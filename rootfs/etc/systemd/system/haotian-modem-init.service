@@ -1,0 +1,13 @@
+[Unit]
+Description=Xiaomi 15 Pro Ordered Modem Initialization (IPA + QWES + RMTFS + DDS)
+After=qwes-bridge.service systemd-modules-load.service
+Requires=qwes-bridge.service
+Before=dmail.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/libexec/haotian-modem-init
+
+[Install]
+WantedBy=multi-user.target
