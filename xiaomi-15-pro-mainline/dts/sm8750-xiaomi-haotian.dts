@@ -1,0 +1,1232 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * Xiaomi 15 Pro (haotian) — 主线 DT 骨架 v0.1
+ *
+ * 数据来源：
+ *   - 真机 DT 反编译：device/haotian-live.dts（44k 行）
+ *   - 社区 vendor DTS：repos/kernel_xiaomi_sm8750-devicetrees-lineage-22.2/qcom/haotian-*.dtsi
+ *   - 主线 SoC 描述：device/sm8750.dtsi（piano 树，v7.2.10）
+ *
+ * 状态：实验性板级 DTS；DTB 可编译，尚无成功的真机 Linux 启动记录。
+ * 带 TODO 的节点仍有未核实的硬件数据。
+ */
+
+/dts-v1/;
+
+#include "sm8750.dtsi"
+#include "pm8550.dtsi"
+#include "pmih0108.dtsi"
+#include "pmk8550.dtsi"
+#include "sm8750-pmics.dtsi"
+#include <dt-bindings/firmware/qcom,scm.h>
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/linux-event-codes.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/leds/common.h>
+#include <dt-bindings/regulator/qcom,rpmh-regulator.h>
+#include <dt-bindings/sound/qcom,q6dsp-lpass-ports.h>
+
+/ {
+	model = "Xiaomi 15 Pro (haotian)";
+	compatible = "xiaomi,haotian", "qcom,sm8750";
+	chassis-type = "handset";
+
+	/* ABL may replace root identity from the stock DTBO. */
+	xiaomi,mainline-model = "Xiaomi 15 Pro (haotian)";
+	xiaomi,mainline-compatible = "xiaomi,haotian", "qcom,sm8750";
+
+	aliases {
+		serial0 = &uart7;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+		/*
+		 * The real command line. The boot image carries an empty cmdline and
+		 * CONFIG_CMDLINE_FROM_BOOTLOADER means the kernel prefers whatever the
+		 * loader supplies, so the built-in CONFIG_CMDLINE was never used —
+		 * which is why console=tty0 and clk_ignore_unused had no effect.
+		 *
+		 * keep_bootcon: do not unregister the boot console when mdss takes
+		 *   over; without it the log vanishes exactly at the KMS handover.
+		 * clk_ignore_unused/pd_ignore_unused: keep the clocks and power domains
+		 *   the bootloader left running for scanout; the late_initcall cleanup
+		 *   otherwise turns them off about a second in.
+		 */
+		/*
+		 * 不再带 console=tty0。
+		 *
+		 * simpledrm 注册在 minor 0、crtc_index 0，而 msm 到 11 秒才 probe。
+		 * 只要 fbcon 绑在 tty0 上，drm_fb_helper_damage_work 就会去等
+		 * simpledrm 那个没有 enable_vblank 的 crtc，1 秒后超时：
+		 *   vblank wait timed out on crtc 0
+		 *   drm_crtc_wait_one_vblank+0x38c
+		 * 而 cmdline 里的 oops=panic 把它变成重启，屏幕就在两行黄线上重现。
+		 *
+		 * 没有 fbcon 后，内核日志走 console=ttyGS0（USB gadget）和 journal；
+		 * Denial 用 DRM 直写，不依赖 fbcon。
+		 */
+		bootargs = "console=ttyGS0,115200 drm.fbdev_emulation=0 clk_ignore_unused pd_ignore_unused loglevel=7 log_buf_len=4M rdinit=/init";
+	};
+
+	clocks {
+		xo_board: xo-board {
+			compatible = "fixed-clock";
+			clock-frequency = <76800000>;
+			#clock-cells = <0>;
+		};
+
+		sleep_clk: sleep-clk {
+			compatible = "fixed-clock";
+			clock-frequency = <32000>;
+			#clock-cells = <0>;
+		};
+
+		bi_tcxo_div2: bi-tcxo-div2-clk {
+			compatible = "fixed-factor-clock";
+			#clock-cells = <0>;
+			clocks = <&rpmhcc RPMH_CXO_CLK>;
+			clock-mult = <1>;
+			clock-div = <2>;
+		};
+
+		bi_tcxo_ao_div2: bi-tcxo-ao-div2-clk {
+			compatible = "fixed-factor-clock";
+			#clock-cells = <0>;
+			clocks = <&rpmhcc RPMH_CXO_CLK_A>;
+			clock-mult = <1>;
+			clock-div = <2>;
+		};
+	};
+
+	/*
+	 * reserved-memory：SoC 公共区域由 sm8750.dtsi 提供；
+	 * 这里只补 haotian 板级新增的几块（地址已与真机 DT 逐条核对）。
+	 */
+	reserved-memory {
+		display_dump_mem: display-dump@81cf4000 {
+			reg = <0x0 0x81cf4000 0x0 0x800>;
+			no-map;
+		};
+
+		rmtfs_mem: rmtfs@d7c00000 {
+			compatible = "qcom,rmtfs-mem";
+			reg = <0x0 0xd7c00000 0x0 0x400000>;
+			no-map;
+
+			qcom,client-id = <1>;
+			qcom,vmid = <QCOM_SCM_VMID_MSS_MSA>;
+		};
+
+		/* IPA DMA may only use IOVAs 0x20000000-0x3fffffff */
+		ipa_iova_resv: ipa-iova-reserved {
+			iommu-addresses = <&ipa 0x0 0x0 0x0 0x20000000>,
+					  <&ipa 0x0 0x40000000 0xffffffff 0xc0000000>;
+		};
+
+		ramoops_mem: ramoops@a3500000 {
+			compatible = "ramoops";
+			reg = <0x0 0xa3500000 0x0 0x400000>;
+			no-map;
+			record-size = <0x40000>;
+			console-size = <0x180000>;
+			pmsg-size = <0x180000>;
+		};
+
+		/*
+		 * ABL 只有在区域名恰好是 'splash_region' 时才会保持显示硬件供电，
+		 * 否则开机瞬间就会把面板断电。
+		 */
+		splash_mem: splash_region@fc800000 {
+			label = "cont_splash_region";
+			reg = <0x0 0xfc800000 0x0 0x2b00000>;
+			iommu-addresses = <&mdss 0 0xfc800000 0 0x2b00000>;
+			no-map;
+		};
+
+		/*
+		 * TODO(M4-b): 真机 DT 里 oem-vm 在 0xf8800000（0x3800000），
+		 * 而 sm8750.dtsi 已声明 oem_vm_mem@f7c00000。
+		 * 两者不一致，待确认哪个是实际生效区间后再决定是否覆盖。
+		 */
+	};
+
+	/* TODO(M4-a): UFS 供电先用固定电压占位，确认 PMIC LDO 后换回 */
+	ufs_vcc_vreg: regulator-ufs-vcc {
+		compatible = "regulator-fixed";
+		regulator-name = "ufs_vcc";
+		regulator-min-microvolt = <2500000>;
+		regulator-max-microvolt = <2500000>;
+		regulator-boot-on;
+	};
+
+	ufs_vccq_vreg: regulator-ufs-vccq {
+		compatible = "regulator-fixed";
+		regulator-name = "ufs_vccq";
+		regulator-min-microvolt = <1200000>;
+		regulator-max-microvolt = <1200000>;
+		regulator-boot-on;
+	};
+
+	/*
+	 * TODO(M3-a): 剩余的固件区域（adsp/cdsp/mpss/camera）已在
+	 * sm8750.dtsi 中声明，haotian 的尺寸仍需逐一核对。
+	 */
+
+	/* TODO(M3-c): 真机是 PM8550VE 的 LDO12（1.896 V），待确认 pmic-id 后换成 &vreg_l12b_1p9 */
+	touch_iovdd_vreg: regulator-touch-iovdd {
+		compatible = "regulator-fixed";
+		regulator-name = "touch_iovdd";
+		regulator-min-microvolt = <1896000>;
+		regulator-max-microvolt = <1896000>;
+		regulator-boot-on;
+	};
+
+	/* 触控 AVDD：原厂 haotian-sm8750.dtsi 由 TLMM GPIO114 使能 */
+	touch_avdd_vreg: regulator-touch-avdd {
+		compatible = "regulator-fixed";
+		regulator-name = "touch_avdd";
+		regulator-min-microvolt = <3000000>;
+		regulator-max-microvolt = <3000000>;
+		gpio = <&tlmm 114 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		regulator-boot-on;
+	};
+
+	/* 面板 VCI：真机是 PMIC L13B（3.0 V），piano.dts 里没有这一路 */
+	panel_vci_vreg: regulator-panel-vci {
+		compatible = "regulator-fixed";
+		regulator-name = "panel_vci";
+		regulator-min-microvolt = <3000000>;
+		regulator-max-microvolt = <3000000>;
+		regulator-boot-on;
+		/* TODO(M3-b): 换成 &vreg_l13b_3p0，需先确认 pmic-id */
+	};
+
+	/* 面板 I/O 供电（1.8 V），同样先固定占位 */
+	panel_vddio_vreg: regulator-panel-vddio {
+		compatible = "regulator-fixed";
+		regulator-name = "panel_vddio";
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+		regulator-boot-on;
+	};
+
+	/* DSI PHY 模拟供电 1.2 V */
+	panel_vdda_vreg: regulator-panel-vdda {
+		compatible = "regulator-fixed";
+		regulator-name = "panel_vdda";
+		regulator-min-microvolt = <1200000>;
+		regulator-max-microvolt = <1200000>;
+		regulator-boot-on;
+	};
+
+	/* DSI PHY 参考供电 0.88 V */
+	panel_vdds_vreg: regulator-panel-vdds {
+		compatible = "regulator-fixed";
+		regulator-name = "panel_vdds";
+		regulator-min-microvolt = <880000>;
+		regulator-max-microvolt = <880000>;
+		regulator-boot-on;
+	};
+
+	/*
+	 * eUSB2 PHY 的两路供电。真机 DT 里是 regulator-fixed，且 always-on；
+	 * 缺这两路时 phy@88e3000 probe 失败，dwc3 就拿不到 UDC。
+	 */
+	usb_vdd_0p88: regulator-usb-vdd-0p88 {
+		compatible = "regulator-fixed";
+		regulator-name = "usb_vdd_0p88";
+		regulator-min-microvolt = <880000>;
+		regulator-max-microvolt = <880000>;
+		regulator-always-on;
+	};
+
+	usb_vdda12_1p2: regulator-usb-vdda12-1p2 {
+		compatible = "regulator-fixed";
+		regulator-name = "usb_vdda12_1p2";
+		regulator-min-microvolt = <1200000>;
+		regulator-max-microvolt = <1200000>;
+		regulator-always-on;
+	};
+
+	gpio-keys {
+		compatible = "gpio-keys";
+
+		pinctrl-0 = <&volume_up_n>;
+		pinctrl-names = "default";
+
+		key-volume-up {
+			label = "Volume Up";
+			linux,code = <KEY_VOLUMEUP>;
+			gpios = <&pm8550_gpios 6 GPIO_ACTIVE_LOW>;
+			debounce-interval = <15>;
+			linux,can-disable;
+			wakeup-source;
+		};
+	};
+
+	/* Xiaomi MCA battery/charging & OTG protocol; USB roles via UCSI. */
+	pmic-glink {
+		compatible = "xiaomi,piano-pmic-glink",
+			     "qcom,sm8750-pmic-glink",
+			     "qcom,sm8550-pmic-glink",
+			     "qcom,pmic-glink";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		connector@0 {
+			compatible = "usb-c-connector";
+			reg = <0>;
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+
+					pmic_glink_hs_in: endpoint {
+						remote-endpoint = <&usb_dwc3_hs>;
+					};
+				};
+			};
+		};
+	};
+
+	sound {
+		compatible = "qcom,sm8750-sndcard", "qcom,sm8450-sndcard";
+		pinctrl-0 = <&i2s1_default>;
+		pinctrl-names = "default";
+
+		model = "Xiaomi-15-Pro";
+
+		speaker-dai-link {
+			link-name = "Secondary TDM Playback";
+
+			cpu {
+				sound-dai = <&q6apmbedai SECONDARY_TDM_RX_0>;
+				dai-tdm-slot-num = <2>;
+				dai-tdm-slot-width = <32>;
+				dai-tdm-slot-rx-mask = <1 1>;
+			};
+
+			codec {
+				sound-dai = <&cs35l43_b>, <&cs35l43_t>;
+				dai-tdm-slot-num = <2>;
+				dai-tdm-slot-width = <32>;
+				dai-tdm-slot-rx-mask = <1 1>;
+			};
+
+			platform {
+				sound-dai = <&q6apm>;
+			};
+		};
+	};
+
+	wcn7860_pmu: wcn7860-pmu {
+		compatible = "qcom,wcn7860-pmu";
+
+		pinctrl-0 = <&wlan_en>, <&bt_en_default>;
+		pinctrl-names = "default";
+
+		wlan-enable-gpios = <&tlmm 16 GPIO_ACTIVE_HIGH>;
+		bt-enable-gpios = <&pm8550ve_f_gpios 3 GPIO_ACTIVE_HIGH>;
+		swctrl-gpios = <&tlmm 18 GPIO_ACTIVE_HIGH>;
+
+		vddio-supply = <&vreg_l3f_1p8>;
+		vddio1p2-supply = <&vreg_l2f_1p2>;
+		vddaon-supply = <&vreg_s5f_0p88>;
+		vdddig-supply = <&vreg_s4d_0p88>;
+		vddrfa1p2-supply = <&vreg_s7i_1p31>;
+		vddrfa1p8-supply = <&vreg_s3g_1p86>;
+
+		clocks = <&rpmhcc RPMH_RF_CLK1>;
+
+		regulators {
+			vreg_pmu_aon_0p9: ldo0 {
+				regulator-name = "vreg_pmu_aon_0p9";
+			};
+
+			vreg_pmu_rfa_1p9: ldo1 {
+				regulator-name = "vreg_pmu_rfa_1p9";
+			};
+
+			vreg_pmu_rfa_1p3: ldo2 {
+				regulator-name = "vreg_pmu_rfa_1p3";
+			};
+
+			vreg_pmu_rfa_0p9: ldo3 {
+				regulator-name = "vreg_pmu_rfa_0p9";
+			};
+
+			vreg_pmu_wlmx_0p9: ldo4 {
+				regulator-name = "vreg_pmu_wlmx_0p9";
+			};
+
+			vreg_pmu_wlcx_0p9: ldo5 {
+				regulator-name = "vreg_pmu_wlcx_0p9";
+			};
+
+			vreg_pmu_btcx_0p9: ldo6 {
+				regulator-name = "vreg_pmu_btcx_0p9";
+			};
+
+			vreg_pmu_btcmx_0p9: ldo7 {
+				regulator-name = "vreg_pmu_btcmx_0p9";
+			};
+
+			vreg_pmu_pcie_1p2: ldo8 {
+				regulator-name = "vreg_pmu_pcie_1p2";
+			};
+
+			vreg_pmu_pcie_0p9: ldo9 {
+				regulator-name = "vreg_pmu_pcie_0p9";
+			};
+		};
+	};
+};
+
+/*
+ * RPMh 真实供电：PM8550 (pmic-id = "b") LDO12 = ldob12 (1.8 V)
+ * 实测 recovery 里 pm_humu_l12 users=1（仅触控），ABL 开机未打开，
+ * 必须通过 RPMh 真实开启，否则 S3910 无 I/O 电压、SPI 全读 0x00。
+ */
+&apps_rsc {
+	regulators-0 {
+		compatible = "qcom,pm8550-rpmh-regulators";
+		qcom,pmic-id = "b";
+
+		vreg_l5b_3p1: ldo5 {
+			regulator-name = "vreg_l5b_3p1";
+			regulator-min-microvolt = <3100000>;
+			regulator-max-microvolt = <3148000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+			regulator-allow-set-load;
+			regulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM
+						   RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l12b_1p8: ldo12 {
+			regulator-name = "vreg_l12b_1p8";
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+			regulator-allow-set-load;
+			regulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM
+						   RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l15b_1p8: ldo15 {
+			regulator-name = "vreg_l15b_1p8";
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+			regulator-allow-set-load;
+			regulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM
+						   RPMH_REGULATOR_MODE_HPM>;
+		};
+	};
+
+	regulators-1 {
+		compatible = "qcom,pm8550ve-rpmh-regulators";
+		qcom,pmic-id = "d";
+
+		vreg_s4d_0p88: smps4 {
+			regulator-name = "vreg_s4d_0p88";
+			regulator-min-microvolt = <876000>;
+			regulator-max-microvolt = <1036000>;
+		};
+	};
+
+	regulators-2 {
+		compatible = "qcom,pm8550ve-rpmh-regulators";
+		qcom,pmic-id = "g";
+
+		vreg_s3g_1p86: smps3 {
+			regulator-name = "vreg_s3g_1p86";
+			regulator-min-microvolt = <1864000>;
+			regulator-max-microvolt = <2000000>;
+		};
+
+		vreg_l3g_1p2: ldo3 {
+			regulator-name = "vreg_l3g_1p2";
+			regulator-min-microvolt = <1200000>;
+			regulator-max-microvolt = <1256000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+			regulator-always-on;
+		};
+	};
+
+	regulators-3 {
+		compatible = "qcom,pm8550ve-rpmh-regulators";
+		qcom,pmic-id = "f";
+
+		vreg_s5f_0p88: smps5 {
+			regulator-name = "vreg_s5f_0p88";
+			regulator-min-microvolt = <876000>;
+			regulator-max-microvolt = <1000000>;
+		};
+
+		vreg_l1f_0p88: ldo1 {
+			regulator-name = "vreg_l1f_0p88";
+			regulator-min-microvolt = <880000>;
+			regulator-max-microvolt = <920000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+			regulator-always-on;
+		};
+
+		vreg_l2f_1p2: ldo2 {
+			regulator-name = "vreg_l2f_1p2";
+			regulator-min-microvolt = <1200000>;
+			regulator-max-microvolt = <1200000>;
+			regulator-always-on;
+		};
+
+		vreg_l3f_1p8: ldo3 {
+			regulator-name = "vreg_l3f_1p8";
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+			regulator-always-on;
+		};
+	};
+
+	regulators-4 {
+		compatible = "qcom,pm8550ve-rpmh-regulators";
+		qcom,pmic-id = "i";
+
+		vreg_s7i_1p31: smps7 {
+			regulator-name = "vreg_s7i_1p31";
+			regulator-min-microvolt = <1312000>;
+			regulator-max-microvolt = <1340000>;
+		};
+	};
+};
+
+&pcie0 {
+	pinctrl-0 = <&pcie0_default_state>;
+	pinctrl-names = "default";
+	status = "okay";
+};
+
+&pcie0_phy {
+	vdda-phy-supply = <&vreg_l1f_0p88>;
+	vdda-pll-supply = <&vreg_l3g_1p2>;
+	status = "okay";
+};
+
+&pcieport0 {
+	wake-gpios = <&tlmm 104 GPIO_ACTIVE_LOW>;
+	reset-gpios = <&tlmm 102 GPIO_ACTIVE_LOW>;
+
+	wifi@0 {
+		compatible = "pci17cb,110e";
+		reg = <0x10000 0x0 0x0 0x0 0x0>;
+
+		vddaon-supply = <&vreg_pmu_aon_0p9>;
+		vddwlcx-supply = <&vreg_pmu_wlcx_0p9>;
+		vddwlmx-supply = <&vreg_pmu_wlmx_0p9>;
+		vddrfa0p9-supply = <&vreg_pmu_rfa_0p9>;
+		vddrfa1p3-supply = <&vreg_pmu_rfa_1p3>;
+		vddrfa1p9-supply = <&vreg_pmu_rfa_1p9>;
+		vddpcie0p9-supply = <&vreg_pmu_pcie_0p9>;
+		vddpcie1p2-supply = <&vreg_pmu_pcie_1p2>;
+	};
+};
+
+/* 电源键 + 音量下键（PMK8550 PON）+ 音量上键（PM8550 GPIO6） */
+&pon_pwrkey {
+	status = "okay";
+};
+
+&pon_resin {
+	linux,code = <KEY_VOLUMEDOWN>;
+	status = "okay";
+};
+
+&pm8550_gpios {
+	volume_up_n: volume-up-n-state {
+		pins = "gpio6";
+		function = "normal";
+		bias-pull-up;
+		input-enable;
+		power-source = <1>;
+	};
+};
+
+&pm8550ve_f_gpios {
+	bt_en_default: bt-en-default-state {
+		pins = "gpio3";
+		function = "normal";
+		power-source = <1>;
+		bias-disable;
+		output-low;
+	};
+};
+
+&pm8550_flash {
+	status = "okay";
+
+	led-0 {
+		function = LED_FUNCTION_FLASH;
+		color = <LED_COLOR_ID_WHITE>;
+		led-sources = <3>;
+		led-max-microamp = <500000>;
+		flash-max-microamp = <1500000>;
+		flash-max-timeout-us = <1280000>;
+		function-enumerator = <0>;
+	};
+
+	led-1 {
+		function = LED_FUNCTION_FLASH;
+		color = <LED_COLOR_ID_YELLOW>;
+		led-sources = <4>;
+		led-max-microamp = <500000>;
+		flash-max-microamp = <1500000>;
+		flash-max-timeout-us = <1280000>;
+		function-enumerator = <1>;
+	};
+};
+
+&qupv3_2 {
+	status = "okay";
+};
+
+&uart14 {
+	pinctrl-0 = <&qup_uart14_default>, <&qup_uart14_cts_rts>;
+	pinctrl-names = "default";
+	status = "okay";
+
+	bluetooth {
+		compatible = "qcom,wcn7860-bt";
+
+		vddaon-supply = <&vreg_pmu_aon_0p9>;
+		vddbtcx-supply = <&vreg_pmu_btcx_0p9>;
+		vddbtcmx-supply = <&vreg_pmu_btcmx_0p9>;
+		vddrfa0p9-supply = <&vreg_pmu_rfa_0p9>;
+		vddrfa1p3-supply = <&vreg_pmu_rfa_1p3>;
+		vddrfa1p9-supply = <&vreg_pmu_rfa_1p9>;
+
+		max-speed = <3200000>;
+	};
+};
+
+/*
+ * 触控：Synaptics TCM（S3910），接 QUPV3 SE0（vendor DTS: &qupv3_se0_spi）
+ * 参数来自 haotian-sm8750.dtsi：IRQ=GPIO162 (LEVEL_LOW), RESET=GPIO161, AVDD=GPIO114, IOVDD=L12B
+ */
+&gpi_dma1 {
+	status = "okay";
+};
+
+&qupv3_1 {
+	status = "okay";
+};
+
+&spi0 {
+	status = "okay";
+
+	touchscreen@0 {
+		compatible = "syna,s3910";
+		reg = <0>;
+		spi-max-frequency = <8000000>;
+
+		interrupt-parent = <&tlmm>;
+		interrupts = <162 IRQ_TYPE_LEVEL_LOW>;
+		reset-gpios = <&tlmm 161 GPIO_ACTIVE_LOW>;
+
+		vdd-supply = <&vreg_l12b_1p8>;
+		avdd-supply = <&touch_avdd_vreg>;
+
+		pinctrl-0 = <&ts_irq_default &ts_rst_default>;
+		pinctrl-names = "default";
+	};
+};
+
+/*
+ * 充电与电量计，接 QUPV3 SE5（vendor DTS: &qupv3_se5_i2c）
+ * 注意：双电芯，mainline 还没有 sc8585 驱动，这里先占位。
+ */
+&i2c5 {
+	status = "okay";
+
+	fuel-gauge@55 {
+		compatible = "ti,bq27z561";
+		reg = <0x55>;
+		status = "okay";
+	};
+
+	charger@6e {
+		compatible = "southchip,sc8585";
+		reg = <0x6e>;
+		status = "disabled";	/* TODO: 驱动缺失 */
+	};
+
+	charger-slave@6f {
+		compatible = "southchip,sc8585";
+		reg = <0x6f>;
+		status = "disabled";	/* TODO: 驱动缺失 */
+	};
+};
+
+/* 指纹（Fuda NU1652），接 QUPV3 SE11 —— 非开机必需，先禁用 */
+&i2c11 {
+	status = "okay";
+
+	fingerprint@41 {
+		compatible = "fuda,nu1652";
+		reg = <0x41>;
+		status = "disabled";
+	};
+};
+
+/*
+ * 显示：O2 系面板（1440x3200，DSC cmd mode，双 DSI）
+ *
+ * vendor DT 参数：h-front 16 / h-back 16 / h-pulse 16
+ *   v-back 20 / v-front 16 / v-pulse 4
+ *   DSC: slice 720x20, 2 slices/pkt, 10bpc, 8bpp
+ *   platform-reset-gpio = TLMM 0x62
+ *   亮度走 bl_ctrl_dcs（DSI 命令），没有 KTZ8866 背光 IC
+ *
+ * 注意：SM8750 的 DSI host 运行时会把 byte_src/pixel_src 重挂到自身
+ * clocks 里的 PLL，不要在 DSI 节点上写 assigned-clock-parents 指向
+ * 主 PHY，否则链路会挂死在初始化阶段。
+ */
+&mdss {
+	memory-region = <&splash_mem>;
+	/*
+	 * 两个 power domain 都必须开，不只是 MDSS_GDSC。
+	 *
+	 * 对照 linux-perpetua 的 sm8750-oneplus-erhai.dts（同 SoC、同为
+	 * bonded dual-DSI，Denial 已跑通）：少了 MDSS_INT2_GDSC 时控制通路
+	 * 会卡在复位里，DPU 照常产生 frame-done 和 page-flip 事件，但一帧
+	 * 都出不到面板上。我们的现象与之一致。
+	 *
+	 * 开 mdss 之前这里还是 disabled（让 simpledrm 直接写 ABL 显存）；
+	 * 原生 KMS 要求 dpcc 内建（CONFIG_SM_DISPCC_8750=y），否则
+	 * clocks = <&dispcc ...> 永远 -EPROBE_DEFER。
+	 */
+	power-domains = <&dispcc MDSS_GDSC>, <&dispcc MDSS_INT2_GDSC>;
+	status = "okay";
+};
+
+&mdss_mdp {
+	/*
+	 * 这里**不能**加 qcom,dpu-disable-multirect。
+	 *
+	 * erhai 禁用 multi-rect 是因为它 144Hz 要四个 mixer 各自独占 pipe；
+	 * 而我们的面板只有一个 plane，DPU 必须用 multi-rect 把这一 个源
+	 * 拆成左右两半喂两个 mixer（bonded dual-DSI 各扫一半）。
+	 *
+	 * 实测：加上该属性后 sspp 只分到一个 pipe（plane 43 → sspp 9，
+	 * multirect_idx 0），而 num_mixers 仍是 2，另一半画面无源，直接黑屏。
+	 */
+	status = "okay";
+};
+
+/*
+ * 单 DSI 命令模式面板。
+ *
+ * 原厂 dsi-panel-o2-42-02-0a-dsc-cmd.dtsi：
+ *   qcom,mdss-dsi-panel-type = "dsi_cmd_mode"
+ *   qcom,dsi-ctrl-num = <0>，qcom,dsi-phy-num = <0>   ← 只有 DSI0
+ *   qcom,display-topology = <2 2 1>                   ← 2 mixer + 2 DSC + 1 interface
+ *   qcom,mdss-dsi-te-pin-select = <1>，te-using-te-pin  ← TE 由 GPIO86 送入
+ *
+ * 之前按 piano/erhai 的样子写成 bonded dual-DSI video mode 是错的：
+ * 面板只在 DSI0 上听命令，并按 TE 节拍收写入。双链路拆半 + 视频流
+ * 会让解码器收到垃圾，表现为半屏绿条。
+ */
+&mdss_dsi0 {
+	vdda-supply = <&panel_vdda_vreg>;
+
+	status = "okay";
+
+	panel@0 {
+		compatible = "xiaomi,o2-42-02-0a";
+		reg = <0>;
+
+		vci-supply = <&panel_vci_vreg>;
+		vddio-supply = <&panel_vddio_vreg>;
+		vddi-supply = <&panel_vddio_vreg>;
+		reset-gpios = <&tlmm 0x62 GPIO_ACTIVE_LOW>;
+
+		/*
+		 * TE 输入：原厂 te-pin-select = 1 且 te-using-te-pin，
+		 * 引脚是 TLMM GPIO86，功能 mdp_vsync。
+		 */
+		pinctrl-0 = <&panel_te_default>;
+		pinctrl-names = "default";
+
+		width-mm = <69>;
+		height-mm = <156>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+
+				panel_in0: endpoint {
+					remote-endpoint = <&mdss_dsi0_out>;
+				};
+			};
+		};
+	};
+};
+
+&mdss_dsi0_out {
+	remote-endpoint = <&panel_in0>;
+	data-lanes = <0 1 2 3>;
+};
+
+/*
+ * DSI1 不使用：这块面板只在 DSI0 上（原厂 qcom,dsi-ctrl-num = <0>）。
+ * 之前为了 bonded dual-DSI 给 dsi1 重挂了 PHY PLL，那套现在一并去掉。
+ */
+&mdss_dsi1 {
+	status = "disabled";
+};
+
+&mdss_dsi0_phy {
+	vdds-supply = <&panel_vdds_vreg>;
+	status = "okay";
+};
+
+&mdss_dsi1_phy {
+	status = "disabled";
+};
+
+
+
+/*
+ * UFS：验证过的 DTB 里 reg 是两段（std + mcq），单段在 MCQ 模式下不正确。
+ * vdd-hba-supply 接 UFS 自身的 PHY 供电占位 regulator。
+ */
+&ufs_mem_hc {
+	reg = <0x0 0x01d84000 0x0 0x3000>, <0x0 0x01da0000 0x0 0x7000>;
+	reg-names = "std", "mcq";
+	vdd-hba-supply = <&ufs_vcc_vreg>;
+
+	reset-gpios = <&tlmm 215 GPIO_ACTIVE_LOW>;
+
+	vcc-supply = <&ufs_vcc_vreg>;
+	vcc-max-microamp = <1300000>;
+	vccq-supply = <&ufs_vccq_vreg>;
+	vccq-max-microamp = <1200000>;
+
+	status = "okay";
+};
+
+/* UFS PHY：电源先用同一对占位 regulator */
+&ufs_mem_phy {
+	vdda-phy-supply = <&ufs_vccq_vreg>;
+	vdda-pll-supply = <&ufs_vcc_vreg>;
+	status = "okay";
+};
+
+/* The stock haotian DT enables this SM8750 GENI debug UART as serial0. */
+&uart7 {
+	status = "okay";
+};
+
+&usb {
+	/* Dual-role USB OTG (Host for mouse/hub + Peripheral for USB gadget) */
+	dr_mode = "otg";
+	maximum-speed = "high-speed";
+	phys = <&usb_hsphy>;
+	phy-names = "usb2-phy";
+	qcom,select-utmi-as-pipe-clk;
+	usb-role-switch;
+	role-switch-default-mode = "peripheral";
+
+	status = "okay";
+};
+
+&usb_dwc3_hs {
+	remote-endpoint = <&pmic_glink_hs_in>;
+};
+
+&pmih0108_eusb2_repeater {
+	qcom,tune-usb2-preem = /bits/ 8 <0x3>;
+	qcom,tune-usb2-amplitude = /bits/ 8 <0xa>;
+	qcom,squelch-detector-bp = <(-2000)>;
+
+	vdd18-supply = <&vreg_l15b_1p8>;
+	vdd3-supply = <&vreg_l5b_3p1>;
+
+	status = "okay";
+};
+
+&usb_hsphy {
+	vdd-supply = <&usb_vdd_0p88>;
+	vdda12-supply = <&usb_vdda12_1p2>;
+	phys = <&pmih0108_eusb2_repeater>;
+	status = "okay";
+};
+
+/* ABL Compatible Section —— 必须与真机 board-id 一致，否则 ABL 拒绝启动 */
+/ {
+	qcom,msm-id = <0x100026a 0x20000>, <0x000027f 0x10000>,
+		      <0x000026a 0x10000>, <0x000027f 0x20000>,
+		      <0x000026a 0x20000>, <0x100027f 0x10000>,
+		      <0x100026a 0x10000>, <0x100027f 0x20000>;
+	qcom,board-id = <0x40008 0>;
+};
+
+/*
+ * DRAM：SoC dtsi 里 memory@a0000000 的大小是 0，等 bootloader 填；
+ * 我们的启动链不会改写 DTB，所以必须在这里给出真实区间。
+ * 下面逐条取自真机 ABL 传给 Android 的 memory 节点（跳过 size=0 的项）。
+ */
+&{/memory@a0000000} {
+	reg = <0x00 0x81960000 0x00 0x000a0000>,
+	      <0x00 0x81a40000 0x00 0x001c0000>,
+	      <0x00 0x81cf4800 0x00 0x0000b800>,
+	      <0x00 0x82460000 0x00 0x00040000>,
+	      <0x00 0xe3720000 0x00 0x150e0000>,
+	      <0x00 0xfc400000 0x00 0x03400000>,
+	      <0x08 0x80000000 0x00 0x2f6fd000>,
+	      <0x08 0xb0000000 0x00 0x05500000>,
+	      <0x0a 0x00000000 0x02 0x00000000>,
+	      <0x08 0xc0000000 0x01 0x40000000>,
+	      <0x08 0xb5700000 0x00 0x01e00000>,
+	      <0x00 0x82800000 0x00 0x02200000>,
+	      <0x00 0x89d80000 0x00 0x01c80000>,
+	      <0x00 0xa3380000 0x00 0x14c80000>,
+	      <0x00 0xb8200000 0x00 0x1cc23000>,
+	      <0x00 0xd5100000 0x00 0x02f00000>;
+};
+
+/*
+ * 诊断用 framebuffer：指向 ABL 的 cont_splash 区域。
+ * 1440x3200, 32bpp, stride = 1440*4 = 5760。
+ *
+ * 这里显式声明 clocks / power-domains / required-opps / interconnects，
+ * 让 simpledrm 在「原生 KMS 还没接管」和「原生 KMS 接管完成」之间
+ * 都不会被 clk_disable_unused / sync_state 把扫出时钟收走。
+ * 形状抄 erhai 和 pad8pro；带宽按 haotian 的 1440x3200@120 重算，
+ * 不要用 piano 的 3200x2136 那组。
+ *
+ * o2_display_mode 时序：hfp/hsync/hbp = 16/16/16, vfp/vsync/vbp = 16/4/20
+ *   htotal = 1440 + 48 = 1488
+ *   vtotal = 3200 + 40 = 3240
+ *   avg  = 1440 * 3200 * 4 * 120 / 1000          = 2211840 kB/s
+ *   peak = 1440 * 3240 * 4 * 120 * 1.2 / 1000    = 2687385 kB/s
+ */
+/ {
+	framebuffer@fc800000 {
+		compatible = "simple-framebuffer";
+		reg = <0x0 0xfc800000 0x0 0x2b00000>;
+		width = <1440>;
+		height = <3200>;
+		stride = <5760>;
+		format = "a8r8g8b8";
+
+		clocks = <&gcc GCC_DISP_HF_AXI_CLK>,
+			 <&dispcc DISP_CC_MDSS_AHB_CLK>,
+			 <&dispcc DISP_CC_MDSS_MDP_CLK>,
+			 <&dispcc DISP_CC_MDSS_VSYNC_CLK>,
+			 <&dispcc DISP_CC_MDSS_BYTE0_CLK>,
+			 <&dispcc DISP_CC_MDSS_BYTE0_INTF_CLK>,
+			 <&dispcc DISP_CC_MDSS_PCLK0_CLK>,
+			 <&dispcc DISP_CC_MDSS_ESC0_CLK>,
+			 <&dispcc DISP_CC_MDSS_BYTE1_CLK>,
+			 <&dispcc DISP_CC_MDSS_BYTE1_INTF_CLK>,
+			 <&dispcc DISP_CC_MDSS_PCLK1_CLK>,
+			 <&dispcc DISP_CC_MDSS_ESC1_CLK>;
+		/*
+		 * MMCX 必须留在列表里，而且只有它有 required-opps。
+		 *
+		 * 试过改成 erhai 的形式（只留两个 GDSC + 两个 nom_l1）：GDSC 没有
+		 * OPP 表，MMCX 又被移走，vblank 中断随之停摆，fbcon 的
+		 * drm_crtc_wait_one_vblank 死等并 panic：
+		 *   pc : drm_crtc_wait_one_vblank
+		 *   drm_fb_helper_damage_work
+		 * 保持三个 power-domain，只在第一个（MMCX）上挂 opp。
+		 */
+		power-domains = <&rpmhpd RPMHPD_MMCX>,
+				<&dispcc MDSS_GDSC>,
+				<&dispcc MDSS_INT2_GDSC>;
+		required-opps = <&rpmhpd_opp_nom_l1>;
+		interconnects = <&mmss_noc MASTER_MDP QCOM_ICC_TAG_ALWAYS
+				 &mc_virt SLAVE_EBI1 QCOM_ICC_TAG_ALWAYS>;
+		interconnect-names = "mdp0-mem";
+		operating-points-v2 = <&framebuffer_opp_table>;
+		/*
+		 * 保持 okay。
+		 *
+		 * 试过 disabled：没用。simpledrm 不是从 DT 节点创建的，而是
+		 * sysfb 解析全局 screen_info（UEFI/ABL 填充）后自己注册的
+		 * platform device——禁 DT 节点只是让 sysfb 换个来源，照样创建。
+		 *
+		 * 真正的崩溃点在内核：simpledrm 的 crtc 没有 enable_vblank，
+		 * fbcon 的 drm_fb_helper_damage_work 却等它的 vblank，1 秒超时
+		 * 后 WARN，被 oops=panic 变成重启。修在 simpledrm 里。
+		 */
+		status = "okay";
+
+		framebuffer_opp_table: opp-table {
+			compatible = "operating-points-v2";
+
+			opp-0 {
+				opp-peak-kBps = <2687385>;
+				opp-avg-kBps = <2211840>;
+			};
+		};
+	};
+};
+
+/*
+ * GPIO 保留范围：与原厂 msm 内核 sun.dtsi 的 qcom,gpios-reserved 一致
+ * (36 37 38 39 74 48 49 50 51)，也和 piano 板级 DTS 的
+ * gpio-reserved-ranges = <36 4>, <48 4>, <74 1> 对得上。
+ * 这些脚由固件/其它执行环境持有，Linux 不应把它们当作可用 GPIO 去操作。
+ */
+&tlmm {
+	gpio-reserved-ranges = <36 4>, <48 4>, <74 1>;
+
+	/*
+	 * TE（tearing effect）输入。
+	 *
+	 * 原厂 te-pin-select = <1> 且 te-using-te-pin，引脚是 TLMM GPIO86，
+	 * 功能 mdp_vsync。命令模式面板靠它告诉 DPU “可以下发下一帧写入”，
+	 * 没有这个信号，写入节奏对不上面板，画面也不会对。
+	 * 写法与同 SoC 的 sm8750-mtp.dts 一致。
+	 */
+	panel_te_default: panel-te-default-state {
+		pins = "gpio86";
+		function = "mdp_vsync";
+		bias-pull-down;
+		drive-strength = <2>;
+	};
+
+	ts_irq_default: ts-irq-default-state {
+		pins = "gpio162";
+		function = "gpio";
+		bias-disable;
+		input-enable;
+	};
+
+	ts_rst_default: ts-rst-default-state {
+		pins = "gpio161";
+		function = "gpio";
+		bias-disable;
+		drive-strength = <2>;
+	};
+
+	wlan_en: wlan-en-state {
+		pins = "gpio16";
+		function = "gpio";
+		drive-strength = <8>;
+		bias-pull-down;
+	};
+
+	i2s1_default: i2s1-default-state {
+		sck-pins {
+			pins = "gpio121";
+			function = "i2s1_sck";
+			drive-strength = <8>;
+			bias-disable;
+		};
+
+		data0-pins {
+			pins = "gpio122";
+			function = "i2s1_data0";
+			drive-strength = <8>;
+			bias-disable;
+		};
+
+		ws-pins {
+			pins = "gpio123";
+			function = "i2s1_ws";
+			drive-strength = <8>;
+			bias-disable;
+		};
+
+		data1-pins {
+			pins = "gpio124";
+			function = "i2s1_data1";
+			drive-strength = <8>;
+			bias-disable;
+		};
+
+		rcv-switch-pins {
+			pins = "gpio67";
+			function = "gpio";
+			drive-strength = <2>;
+			bias-pull-up;
+			output-high;
+		};
+	};
+};
+
+&q6apmbedai {
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	dai@28 {
+		reg = <SECONDARY_TDM_RX_0>;
+		clocks = <&q6prmcc LPASS_CLK_ID_SEC_TDM_IBIT
+				   LPASS_CLK_ATTRIBUTE_COUPLE_NO>;
+		clock-names = "bclk";
+	};
+};
+
+&i2c_master_hub_0 {
+	status = "okay";
+};
+
+&i2c_hub_0 {
+	clock-frequency = <400000>;
+	status = "okay";
+
+	cs35l43_b: audio-codec@40 {
+		compatible = "cirrus,cs35l43";
+		reg = <0x40>;
+		#sound-dai-cells = <0>;
+		interrupt-parent = <&tlmm>;
+		interrupts = <84 IRQ_TYPE_LEVEL_LOW>;
+		reset-gpios = <&tlmm 107 GPIO_ACTIVE_HIGH>;
+		sound-name-prefix = "B";
+		cirrus,bst-ipk-ma = <4000>;
+		cirrus,asp-sdout-hiz = <3>;
+		cirrus,gpio2-src-sel = <4>;
+		cirrus,vpbr-enable = <1>;
+		cirrus,vpbr-thld = <4>;
+		cirrus,vpbr-max-att = <6>;
+		cirrus,vpbr-atk-vol = <5>;
+		cirrus,vpbr-atk-rate = <0>;
+		cirrus,vpbr-wait = <0>;
+		cirrus,vpbr-rel-rate = <0>;
+		cirrus,low-pwr-mode-standby = <1>;
+	};
+
+	cs35l43_t: audio-codec@42 {
+		compatible = "cirrus,cs35l43";
+		reg = <0x42>;
+		#sound-dai-cells = <0>;
+		interrupt-parent = <&tlmm>;
+		interrupts = <66 IRQ_TYPE_LEVEL_LOW>;
+		reset-gpios = <&tlmm 108 GPIO_ACTIVE_HIGH>;
+		sound-name-prefix = "T";
+		cirrus,bst-ipk-ma = <4000>;
+		cirrus,asp-sdout-hiz = <3>;
+		cirrus,gpio2-src-sel = <4>;
+		cirrus,vpbr-enable = <1>;
+		cirrus,vpbr-thld = <4>;
+		cirrus,vpbr-max-att = <6>;
+		cirrus,vpbr-atk-vol = <5>;
+		cirrus,vpbr-atk-rate = <0>;
+		cirrus,vpbr-wait = <0>;
+		cirrus,vpbr-rel-rate = <0>;
+		cirrus,low-pwr-mode-standby = <1>;
+	};
+};
+
+/*
+ * GPU：Adreno 830（qcom,adreno-44050001）。
+ *
+ * 默认 sm8750.dtsi 里 gpu 节点是 disabled；启用后 msm 驱动才会 probe，
+ * /dev/dri/renderD128 才会出现。GBM/EGL 依赖它，Denial 的合成器没有它就
+ * 无法分配 GPU 缓冲。
+ *
+ * zap shader 是按机型签名的：haotian 的来自本机 odm_a 的
+ * /firmware/gen80000_zap.mbn（md5 dcd4e54d07664f97a8f87598cf7ec48d），
+ * 与 piano 的那份（b00435e8…）不同，不能通用。
+ */
+&gpu {
+	status = "okay";
+};
+
+&gpu_zap_shader {
+	firmware-name = "qcom/sm8750/xiaomi/haotian/gen80000_zap.mbn";
+};
+
+&adspslpi_mem {
+	reg = <0x0 0x9ee00000 0x0 0x4580000>;
+};
+
+&remoteproc_adsp {
+	firmware-name = "qcom/sm8750/xiaomi/haotian/adsp.mdt",
+			"qcom/sm8750/xiaomi/haotian/adsp_dtb.mdt";
+	status = "okay";
+};
+
+&remoteproc_cdsp {
+	firmware-name = "qcom/sm8750/xiaomi/haotian/cdsp.mdt",
+			"qcom/sm8750/xiaomi/haotian/cdsp_dtb.mdt";
+	status = "okay";
+};
+
+&remoteproc_mpss {
+	firmware-name = "qcom/sm8750/xiaomi/haotian/modem.mdt",
+			"qcom/sm8750/xiaomi/haotian/modem_dtb.mdt";
+	status = "okay";
+};
+
+&soc {
+	sram@14680000 {
+		compatible = "qcom,sm8550-imem", "syscon", "simple-mfd";
+		reg = <0x0 0x14680000 0x0 0x2c000>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges = <0 0x0 0x14680000 0x2c000>;
+
+		ipa_modem_tables: modem-tables@3000 {
+			reg = <0x3000 0x2000>;
+		};
+	};
+
+	ipa: ipa@3f40000 {
+		compatible = "qcom,sm8750-ipa";
+
+		iommus = <&apps_smmu 0x4a0 0x0>,
+			 <&apps_smmu 0x4a2 0x0>;
+		reg = <0x0 0x3f40000 0x0 0x10000>,
+		      <0x0 0x3f50000 0x0 0x5000>,
+		      <0x0 0x3e04000 0x0 0xfc000>;
+		reg-names = "ipa-reg",
+			    "ipa-shared",
+			    "gsi";
+
+		interrupts-extended = <&intc GIC_SPI 655 IRQ_TYPE_LEVEL_HIGH>,
+				      <&intc GIC_SPI 432 IRQ_TYPE_LEVEL_HIGH>,
+				      <&ipa_smp2p_in 0 IRQ_TYPE_EDGE_RISING>,
+				      <&ipa_smp2p_in 1 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "ipa",
+				  "gsi",
+				  "ipa-clock-query",
+				  "ipa-setup-ready";
+
+		clocks = <&rpmhcc RPMH_IPA_CLK>;
+		clock-names = "core";
+
+		interconnects = <&aggre2_noc MASTER_IPA QCOM_ICC_TAG_ALWAYS
+				 &mc_virt SLAVE_EBI1 QCOM_ICC_TAG_ALWAYS>,
+				<&gem_noc MASTER_APPSS_PROC QCOM_ICC_TAG_ACTIVE_ONLY
+				 &config_noc SLAVE_IPA_CFG QCOM_ICC_TAG_ACTIVE_ONLY>;
+		interconnect-names = "memory",
+				     "config";
+
+		qcom,qmp = <&aoss_qmp>;
+
+		qcom,smem-states = <&ipa_smp2p_out 0>,
+				   <&ipa_smp2p_out 1>;
+		qcom,smem-state-names = "ipa-clock-enabled-valid",
+					"ipa-clock-enabled";
+
+		sram = <&ipa_modem_tables>;
+		qcom,gsi-loader = "self";
+		memory-region = <&ipa_gsi_mem>, <&ipa_iova_resv>;
+		firmware-name = "qcom/sm8750/xiaomi/haotian/ipa_fws.mdt";
+
+		status = "okay";
+	};
+};
+
+#include "sm8750-xiaomi-haotian-camera.dtsi"

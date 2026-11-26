@@ -1,0 +1,17 @@
+[Unit]
+Description=Xiaomi 15 Pro QTEE Listener and QWES License Bridge (QRTR 1059)
+After=local-fs.target systemd-udev-settle.service systemd-journal-flush.service
+Before=haotian-modem-init.service dmail.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/libexec/haotian-tee-sync
+ExecStart=/usr/local/bin/qwes-bridge
+StandardOutput=journal
+StandardError=journal
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target
