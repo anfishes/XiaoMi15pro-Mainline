@@ -1,5 +1,5 @@
 # Xiaomi 15 Pro (`haotian`) — Mainline Linux Bring-up
-
+！！！含有vibe内容，过敏谨慎食用。
 Mainline Linux (`7.2.10` based on `linux-sm8750-piano`) + Denial / Phonewave Wayland bring-up for the **Xiaomi 15 Pro** (`haotian`, model `2410DPN6CC`, Qualcomm Snapdragon 8 Elite / SM8750P).
 
 > **Disclaimer & Firmware Notice**
